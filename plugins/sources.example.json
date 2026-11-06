@@ -1,0 +1,10 @@
+[
+  {
+    "name": "Nguồn của bạn",
+    "domains": ["your-authorized-source.example"],
+    "chapter_title": "h1.chapter-title",
+    "content": "#chapter-content",
+    "next": "a.next-chapter",
+    "remove": "script, style, iframe, form, button, .advertisement"
+  }
+]

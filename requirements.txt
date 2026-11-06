@@ -1,0 +1,7 @@
+customtkinter==5.2.2
+aiohttp>=3.10,<4
+aiofiles>=24.1
+beautifulsoup4>=4.12
+FanFicFare==4.60.0
+lxml>=5.3
+

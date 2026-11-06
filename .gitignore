@@ -1,0 +1,18 @@
+﻿
+# Truyện tải về và dữ liệu ứng dụng
+Downloads/
+.nd-data/
+
+# Môi trường, trình duyệt và bộ nhớ đệm
+.venv/
+venv/
+.browsers/
+__pycache__/
+*.pyc
+_updates/
+*.log
+
+# Thông tin riêng tư
+.env
+.env.*
+!.env.example
