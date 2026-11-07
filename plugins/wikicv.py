@@ -8,6 +8,7 @@ from plugins.base import BaseCrawler
 from core.storage import atomic_text, atomic_json, read_json
 from core.cleanup import cleanup_completed_story
 from core.browser import BrowserSession
+from core.wikicv_content import clean_content
 from core.http_reader import HttpChapterSession, AutoChapterSession
 import utils
 
@@ -29,27 +30,6 @@ def part_numbers(soup):
     if values and sorted(values) != list(range(max(values) + 1)):
         raise RuntimeError('Danh sách phần bị thiếu số; chưa thể ghép chương.')
     return sorted(values) or [0]
-
-
-def clean_content(soup):
-    body = soup.select_one('#bookContentBody')
-    if body is None:
-        raise RuntimeError('Không tìm thấy #bookContentBody; chưa lưu chương này.')
-    body = BeautifulSoup(str(body), 'html.parser')
-    for node in body.select('script, style, iframe, noscript, form, button, .tpm-unit, .adsbygoogle, .chapter-part, [id^="tpads_"]'):
-        node.decompose()
-    for node in body.find_all('br'):
-        node.replace_with('\n')
-    # Block boundaries, preserve inline words and text outside <p> as well.
-    for node in body.find_all(['p', 'div']):
-        node.insert_before('\n\n')
-        node.insert_after('\n\n')
-    text = body.get_text().strip()
-    import re
-    text = re.sub(r'\n[ \t]*\n(?:[ \t]*\n)+', '\n\n', text)
-    if not text:
-        raise RuntimeError('Phần truyện rỗng; chưa đánh dấu hoàn tất.')
-    return text
 
 
 class WikiCVCrawler(BaseCrawler):

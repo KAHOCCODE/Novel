@@ -2,8 +2,13 @@
 import asyncio
 import os
 from pathlib import Path
-from plugins.base import challenge_page, VerificationRequired
+from urllib.parse import urlsplit
+
+from bs4 import BeautifulSoup
+
+from plugins.base import challenge_page, retry_after, VerificationRequired
 from core.network import NetworkFailure
+from core.wikicv_content import clean_content
 
 
 class BrowserSession:
@@ -13,6 +18,7 @@ class BrowserSession:
         self.context = self.page = self.playwright = None
         self.network_failed = False
         self.part_retry_after = None
+        self.chapter_url = ''
 
     async def __aenter__(self):
         try:
@@ -37,14 +43,21 @@ class BrowserSession:
             launch['proxy'] = {'server': self.crawler.network.proxy}
         self.context = await self.playwright.chromium.launch_persistent_context(str(profile), **launch)
         self.page = await self.context.new_page()
+
+        def from_chapter(request):
+            return (request.resource_type in {'xhr', 'fetch'}
+                    and urlsplit(request.url).hostname == urlsplit(self.chapter_url).hostname)
+
         def failed(request):
-            if request.resource_type in {'document', 'xhr', 'fetch'}:
+            if from_chapter(request):
                 self.network_failed = True
-        self.page.on('requestfailed', failed)
+
         def response_received(response):
-            if response.status == 403 and response.request.resource_type in {'xhr', 'fetch'}:
+            if response.status == 403 and from_chapter(response.request):
                 self.network_failed = True
                 self.part_retry_after = response.headers.get('retry-after')
+
+        self.page.on('requestfailed', failed)
         self.page.on('response', response_received)
 
     async def _reconnect(self, reason):
@@ -77,6 +90,7 @@ class BrowserSession:
         self.crawler.report_progress(state='running', status='Đang kiểm tra lại phiên truy cập')
 
     async def get(self, url, required=None):
+        self.chapter_url = url
         for attempt in range(4):
             await self.crawler.throttle()
             self.crawler.log_request(url, attempt + 1)
@@ -93,13 +107,11 @@ class BrowserSession:
             self.crawler.log(f'[HTTP {status}] {url}')
             html = await self.page.content()
             if status == 429 or status in (500, 502, 503, 504) and not challenge_page(html):
-                from plugins.base import retry_after
                 delay = retry_after(response.headers.get('retry-after'), 10 * 2**attempt)
                 self.crawler.log(f'HTTP {status}; nghỉ {delay:.0f}s trước khi thử lại.')
                 await self.crawler.sleep_check_stop(delay)
                 continue
             if status == 403 and not challenge_page(html) and attempt < 3 and self.crawler.network.proxy:
-                from plugins.base import retry_after
                 await self.crawler.sleep_check_stop(retry_after(response.headers.get('retry-after') if response else None, 15))
                 if await self._reconnect('Nguồn từ chối kết nối hiện tại (403)'):
                     continue
@@ -118,35 +130,87 @@ class BrowserSession:
         raise RuntimeError('Máy chủ chưa phản hồi sau các lần thử. Tiến độ được giữ lại.')
 
     async def part(self, part_number):
+        chapter_url = self.chapter_url
+        for attempt in range(2):
+            html, reason = await self._read_part(part_number)
+            if html is not None:
+                return html
+            if self.network_failed:
+                await self.crawler.sleep_check_stop(retry_after(self.part_retry_after, 15))
+            if attempt == 0:
+                self.crawler.log(f'[THỬ LẠI PHẦN] Phần {part_number + 1}: {reason}. Mở lại trang để tải riêng phần này.')
+                await self.get(chapter_url, required='#bookContentBody')
+
+        message = f'Chưa tải được Phần {part_number + 1} sau 2 lượt: {reason}. Đã giữ các phần đã lưu.'
+        if self.network_failed:
+            raise NetworkFailure(message)
+        raise RuntimeError(message)
+
+    async def _read_part(self, part_number):
         await self.crawler.throttle()
         page = self.page
         self.network_failed = False
         self.part_retry_after = None
         selector = f'a.chapter-part[data-pn="{part_number}"]'
-        before = await page.locator('#bookContentBody').inner_html()
-        await page.locator(selector).first.click()
         try:
-            await page.wait_for_function('''({pn, before}) => {
-                const body = document.querySelector('#bookContentBody');
-                const active = document.querySelector('a.chapter-part.active');
-                return body && active && active.dataset.pn === String(pn) && body.innerHTML !== before;
-            }''', arg={'pn': part_number, 'before': before}, timeout=30000)
-        except Exception as exc:
-            if challenge_page(await page.content()):
-                await self.verify(page.url)
-            if self.network_failed:
-                from plugins.base import retry_after
-                await self.crawler.sleep_check_stop(retry_after(self.part_retry_after, 15))
-                raise NetworkFailure(f'Mất kết nối khi tải Phần {part_number + 1}; sẽ khôi phục từ phần đã lưu.') from exc
-            raise RuntimeError(f'Chưa xác nhận được nội dung Phần {part_number + 1}. Đã giữ tiến độ, hãy thử lại.') from exc
-        # Let the final DOM update settle; never accept a loading placeholder.
-        previous = await page.locator('#bookContentBody').inner_html()
-        for _ in range(12):
+            html = await asyncio.wait_for(page.content(), timeout=5)
+        except asyncio.TimeoutError:
+            return None, 'Chromium không trả về nội dung'
+        soup = BeautifulSoup(html, 'html.parser')
+        button = soup.select_one(selector)
+        if button is None:
+            return None, 'không tìm thấy nút của phần này'
+        try:
+            before = clean_content(soup)
+        except RuntimeError:
+            before = None
+        chapter_id = button.get('data-id')
+        try:
+            await asyncio.wait_for(page.locator(selector).first.click(timeout=0), timeout=8)
+        except asyncio.TimeoutError:
+            return None, 'không bấm được nút tải phần trong 8 giây'
+
+        previous = None
+        stable_samples = 0
+        reason = 'trang chưa chuyển sang đúng phần'
+        for _ in range(36):
             await self.crawler.sleep_check_stop(.5)
-            current = await page.locator('#bookContentBody').inner_html()
-            text = (await page.locator('#bookContentBody').inner_text()).strip()
-            loading = text.casefold().strip('.…! ') in {'loading', 'đang tải', 'đang tải nội dung', 'vui lòng chờ'}
-            if current == previous and current != before and text and not loading and not self.network_failed:
-                return await page.content()
-            previous = current
-        raise RuntimeError(f'Nội dung Phần {part_number + 1} chưa ổn định; hãy thử lại.')
+            try:
+                html = await asyncio.wait_for(page.content(), timeout=5)
+            except asyncio.TimeoutError:
+                return None, 'Chromium không trả về nội dung'
+            soup = BeautifulSoup(html, 'html.parser')
+            if soup.select_one('#bookContentBody') is None and challenge_page(html):
+                await self.verify(page.url)
+                return None, 'cần mở lại trang sau khi xác minh'
+            active = soup.select_one('a.chapter-part.active')
+            text = None
+            if (active and active.get('data-pn') == str(part_number)
+                    and active.get('data-id') == chapter_id):
+                try:
+                    text = clean_content(soup)
+                except RuntimeError:
+                    reason = 'vùng nội dung đang rỗng'
+                if text:
+                    loading = ' '.join(text.casefold().split()).strip('.…! ')
+                    if text == before or loading in {'loading', 'đang tải', 'đang tải nội dung', 'vui lòng chờ'}:
+                        text = None
+                        reason = 'trang còn hiện nội dung cũ hoặc thông báo đang tải'
+                    else:
+                        reason = 'văn bản truyện vẫn đang thay đổi'
+            else:
+                reason = 'trang chưa chuyển sang đúng phần'
+            # Compare the exact text we will save, not markup that can change independently.
+            if text is None:
+                stable_samples = 0
+            elif text == previous:
+                stable_samples += 1
+            else:
+                stable_samples = 1
+            if stable_samples >= 3:
+                return html, ''
+            previous = text
+
+        if self.network_failed:
+            reason += ' (có yêu cầu mạng cùng nguồn bị lỗi)'
+        return None, reason
